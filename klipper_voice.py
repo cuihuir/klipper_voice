@@ -63,14 +63,45 @@ class KlipperVoice:
         # Base directory for audio files
         self.audio_base_path = config.get('audio_path', '/home/pi/klipper_voice_files')
         
-        # Audio file format/extension
-        self.audio_format = config.get('audio_format', 'mp3')
+        # Supported audio formats (auto-detected)
+        self.supported_formats = ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac']
         
-        # Audio player command (can be 'mpg123', 'aplay', 'paplay', etc.)
-        self.audio_player = config.get('audio_player', 'mpg123')
+        # Audio player priority list (will auto-detect best available)
+        self.audio_players = {
+            'ffmpeg': {
+                'command': 'ffmpeg',
+                'args': ['-i', '{file}', '-f', 'alsa', 'default', '-v', 'quiet'],
+                'volume_support': True,
+                'formats': ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'wma']
+            },
+            'mpg123': {
+                'command': 'mpg123',
+                'args': ['-q', '{file}'],
+                'volume_support': True,
+                'formats': ['mp3']
+            },
+            'aplay': {
+                'command': 'aplay',
+                'args': ['-q', '{file}'],
+                'volume_support': False,
+                'formats': ['wav']
+            },
+            'paplay': {
+                'command': 'paplay',
+                'args': ['{file}'],
+                'volume_support': True,
+                'formats': ['wav', 'ogg', 'flac']
+            },
+            'cvlc': {
+                'command': 'cvlc',
+                'args': ['--intf', 'dummy', '--play-and-exit', '{file}'],
+                'volume_support': True,
+                'formats': ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac']
+            }
+        }
         
-        # Additional audio player arguments
-        self.audio_player_args = config.get('audio_player_args', '-q').split()
+        # Auto-detected audio player (will be set during initialization)
+        self.selected_player = None
         
         # Enable hardware volume control through player
         self.use_hardware_volume = config.getboolean('use_hardware_volume', True)
@@ -161,20 +192,59 @@ class KlipperVoice:
             self.logger.error("Failed to create audio directory %s: %s", 
                             self.audio_base_path, str(e))
         
-        # === Validate Audio Player ===
-        try:
-            result = subprocess.run(['which', self.audio_player], 
-                                  capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                self.logger.info("Audio player found: %s", self.audio_player)
-            else:
-                self.logger.warning("Audio player not found: %s", self.audio_player)
-                self.logger.warning("Voice announcements will be logged only")
-        except Exception as e:
-            self.logger.error("Error checking audio player: %s", str(e))
+        # === Auto-detect Best Audio Player ===
+        self._detect_audio_player()
         
         # === Scan Audio Files ===
         self._scan_audio_files()
+    
+    def _detect_audio_player(self):
+        """
+        Auto-detect the best available audio player.
+        
+        Priority order:
+        1. ffmpeg (most versatile, supports all formats)
+        2. mpg123 (good for MP3)
+        3. paplay (PulseAudio)
+        4. cvlc (VLC)
+        5. aplay (basic ALSA)
+        
+        Sets self.selected_player to the best available option.
+        """
+        # Priority order for audio players
+        priority_order = ['ffmpeg', 'mpg123', 'paplay', 'cvlc', 'aplay']
+        
+        for player_name in priority_order:
+            if player_name not in self.audio_players:
+                continue
+                
+            player_config = self.audio_players[player_name]
+            command = player_config['command']
+            
+            try:
+                # Check if the command is available
+                result = subprocess.run(['which', command], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    self.selected_player = player_name
+                    self.logger.info("Selected audio player: %s (%s)", 
+                                   player_name, command)
+                    self.logger.info("Supported formats: %s", 
+                                   ', '.join(player_config['formats']))
+                    return
+            except Exception as e:
+                self.logger.debug("Error checking %s: %s", command, str(e))
+        
+        # No audio player found
+        self.selected_player = None
+        self.logger.warning("No audio player found. Available players: %s", 
+                          ', '.join(priority_order))
+        self.logger.warning("Voice announcements will be logged only")
+        self.logger.info("To install audio players, try:")
+        self.logger.info("  sudo apt install ffmpeg          # (recommended)")
+        self.logger.info("  sudo apt install mpg123")
+        self.logger.info("  sudo apt install pulseaudio-utils")
+        self.logger.info("  sudo apt install vlc")
     
     def _scan_audio_files(self):
         """
@@ -192,7 +262,9 @@ class KlipperVoice:
         
         try:
             for filename in os.listdir(self.audio_base_path):
-                if not filename.endswith('.' + self.audio_format):
+                # Check if file has supported format
+                file_ext = filename.split('.')[-1].lower()
+                if file_ext not in self.supported_formats:
                     continue
                 
                 # Parse filename: message_type.language.format
@@ -200,17 +272,21 @@ class KlipperVoice:
                 if len(name_parts) >= 2:
                     message_type = name_parts[0]
                     language = name_parts[1] if len(name_parts) == 3 else 'default'
+                    format_ext = name_parts[-1].lower()
                     
                     # Build file path
                     file_path = os.path.join(self.audio_base_path, filename)
                     
-                    # Store in cache
+                    # Store in cache with format info
                     if message_type not in self.audio_file_cache:
                         self.audio_file_cache[message_type] = {}
-                    self.audio_file_cache[message_type][language] = file_path
+                    if language not in self.audio_file_cache[message_type]:
+                        self.audio_file_cache[message_type][language] = {}
                     
-                    self.logger.debug("Found audio file: %s -> %s (%s)", 
-                                    message_type, file_path, language)
+                    self.audio_file_cache[message_type][language][format_ext] = file_path
+                    
+                    self.logger.debug("Found audio file: %s -> %s (%s, %s)", 
+                                    message_type, file_path, language, format_ext)
             
             self.logger.info("Audio file scan complete. Found %d message types", 
                            len(self.audio_file_cache))
@@ -422,30 +498,61 @@ class KlipperVoice:
             str: Path to audio file, or None if not found
             
         Lookup priority:
-        1. message_type.current_language.format
-        2. message_type.en.format (fallback to English)
-        3. message_type.default.format (generic fallback)
+        1. message_type.current_language.supported_format
+        2. message_type.en.supported_format (fallback to English)
+        3. message_type.default.supported_format (generic fallback)
+        4. Any available file
         """
         if message_type not in self.audio_file_cache:
             return None
         
         language_files = self.audio_file_cache[message_type]
         
+        # Get supported formats for current player
+        if self.selected_player:
+            supported_formats = self.audio_players[self.selected_player]['formats']
+        else:
+            supported_formats = self.supported_formats
+        
         # Try current language first
         if self.language in language_files:
-            return language_files[self.language]
+            return self._get_best_format_file(language_files[self.language], supported_formats)
         
         # Fallback to English
         if 'en' in language_files:
-            return language_files['en']
+            return self._get_best_format_file(language_files['en'], supported_formats)
         
         # Fallback to default
         if 'default' in language_files:
-            return language_files['default']
+            return self._get_best_format_file(language_files['default'], supported_formats)
         
         # Use any available file
-        if language_files:
-            return next(iter(language_files.values()))
+        for lang_formats in language_files.values():
+            result = self._get_best_format_file(lang_formats, supported_formats)
+            if result:
+                return result
+        
+        return None
+    
+    def _get_best_format_file(self, format_files, supported_formats):
+        """
+        Get the best available format file for the current player.
+        
+        Args:
+            format_files (dict): Dictionary of format -> file_path
+            supported_formats (list): List of supported formats
+            
+        Returns:
+            str: Path to best format file, or None if not found
+        """
+        # Try formats in order of preference
+        for format_ext in supported_formats:
+            if format_ext in format_files:
+                return format_files[format_ext]
+        
+        # If no preferred format, use any available
+        if format_files:
+            return next(iter(format_files.values()))
         
         return None
     
@@ -462,20 +569,40 @@ class KlipperVoice:
         """
         with self.playback_lock:
             try:
-                # Build command
-                cmd = [self.audio_player] + self.audio_player_args
+                if not self.selected_player:
+                    self.logger.warning("No audio player available for playback")
+                    return
+                
+                player_config = self.audio_players[self.selected_player]
+                
+                # Build command from player configuration
+                cmd = [player_config['command']]
+                
+                # Process arguments and replace {file} placeholder
+                for arg in player_config['args']:
+                    if '{file}' in arg:
+                        cmd.append(arg.replace('{file}', audio_file))
+                    else:
+                        cmd.append(arg)
                 
                 # Add volume control if supported
-                if self.use_hardware_volume and self.audio_player == 'mpg123':
-                    # mpg123 volume control: -g <gain> (0-100)
-                    gain = int(self.volume * 100)
-                    cmd.extend(['-g', str(gain)])
-                elif self.use_hardware_volume and self.audio_player in ['aplay', 'paplay']:
-                    # For aplay/paplay, we might need to use amixer for volume
-                    pass  # Volume control handled separately
-                
-                # Add audio file
-                cmd.append(audio_file)
+                if self.use_hardware_volume and player_config['volume_support']:
+                    if self.selected_player == 'ffmpeg':
+                        # FFmpeg volume control: -filter:a "volume=0.8"
+                        volume_filter = f"volume={self.volume}"
+                        cmd.extend(['-filter:a', volume_filter])
+                    elif self.selected_player == 'mpg123':
+                        # mpg123 volume control: -g <gain> (0-100)
+                        gain = int(self.volume * 100)
+                        cmd.extend(['-g', str(gain)])
+                    elif self.selected_player == 'paplay':
+                        # paplay volume control: --volume <0-65536>
+                        volume = int(self.volume * 65536)
+                        cmd.extend(['--volume', str(volume)])
+                    elif self.selected_player == 'cvlc':
+                        # VLC volume control: --volume <0-256>
+                        volume = int(self.volume * 256)
+                        cmd.extend(['--volume', str(volume)])
                 
                 self.logger.debug("Executing audio command: %s", ' '.join(cmd))
                 
@@ -651,7 +778,10 @@ class KlipperVoice:
             'last_announcement_time': self.last_announcement_time,
             'queue_length': len(self.announcement_queue),
             'auto_announce': self.auto_announce,
-            'available_messages': list(self.voice_messages.keys())
+            'available_messages': list(self.voice_messages.keys()),
+            'audio_player': self.selected_player,
+            'supported_formats': self.supported_formats,
+            'available_players': list(self.audio_players.keys())
         }
     
     # === G-code Command Implementations ===
@@ -774,6 +904,8 @@ class KlipperVoice:
             "  Volume: %.1f" % self.volume,
             "  Speed: %.1f" % self.voice_speed,
             "  Language: %s" % self.language,
+            "  Audio Player: %s" % (self.selected_player or "None"),
+            "  Supported Formats: %s" % ", ".join(self.supported_formats),
             "  Last announcement: %s" % (self.last_announcement or "None"),
             "  Queue length: %d" % len(self.announcement_queue)
         ]
@@ -831,11 +963,17 @@ class KlipperVoice:
         self._scan_audio_files()
         
         # === Report Results ===
-        total_files = sum(len(lang_files) for lang_files in self.audio_file_cache.values())
+        total_files = 0
+        for msg_type in self.audio_file_cache.values():
+            for lang_files in msg_type.values():
+                total_files += len(lang_files)
+        
         message_types = list(self.audio_file_cache.keys())
         
         gcmd.respond_info("Audio file scan completed:")
+        gcmd.respond_info("  Audio Player: %s" % (self.selected_player or "None"))
         gcmd.respond_info("  Found %d audio files" % total_files)
+        gcmd.respond_info("  Supported Formats: %s" % ", ".join(self.supported_formats))
         gcmd.respond_info("  Available message types: %s" % ", ".join(message_types))
         
         # === Show Missing Files ===
